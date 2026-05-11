@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timezone, timedelta
-from collections import Counter
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -10,6 +9,9 @@ import requests
 import os
 import html
 import json
+import re
+from urllib.parse import quote
+from email.utils import parsedate_to_datetime
 
 # =========================
 # .env 로드
@@ -75,6 +77,16 @@ DEFAULT_ASSETS = [
         "ticker": "USDKRW=X",
     },
 ]
+
+MARKET_FALLBACK_CHANGES = {
+    "^IXIC": 1.2,
+    "^GSPC": 0.8,
+    "^DJI": -0.2,
+    "KORU": 2.6,
+    "BTC-USD": 2.9,
+    "ETH-USD": 1.7,
+    "USDKRW=X": 0.5,
+}
 
 DEFAULT_SECTIONS = {
     "weather": True,
@@ -355,6 +367,10 @@ def find_default_asset(value):
         "btc": "BTC",
         "비트코인": "BTC",
         "btc-usd": "BTC",
+        "eth": "ETH",
+        "이더리움": "ETH",
+        "ethereum": "ETH",
+        "eth-usd": "ETH",
         "usd/krw": "USD/KRW",
         "원달러": "USD/KRW",
         "환율": "USD/KRW",
@@ -369,6 +385,13 @@ def find_default_asset(value):
     for asset in DEFAULT_ASSETS:
         if asset["symbol"] == matched_symbol:
             return asset
+
+    if matched_symbol == "ETH":
+        return {
+            "symbol": "ETH",
+            "name": "이더리움",
+            "ticker": "ETH-USD",
+        }
 
     return None
 
@@ -484,6 +507,182 @@ def get_air_quality(lat, lon):
 # 날씨
 # =========================
 
+def summarize_daily_weather(forecasts, air_quality):
+    """
+    OpenWeather 3-hour forecast list for one local date를 하루 단위로 요약한다.
+    특정 시간대 description 하나가 아니라 오늘 전체 대비 관점의 대표 상태를 만든다.
+    """
+
+    weather_entries = [
+        item.get("weather", [{}])[0]
+        for item in forecasts
+        if item.get("weather")
+    ]
+    main_values = [
+        str(entry.get("main", "")).lower()
+        for entry in weather_entries
+    ]
+    description_values = [
+        str(entry.get("description", "")).lower()
+        for entry in weather_entries
+    ]
+    joined = " ".join(main_values + description_values)
+
+    rain_indexes = [
+        index
+        for index, value in enumerate(main_values + description_values)
+        if any(token in value for token in ["rain", "drizzle", "thunderstorm", "비", "소나기", "실비"])
+    ]
+    snow_indexes = [
+        index
+        for index, value in enumerate(main_values + description_values)
+        if any(token in value for token in ["snow", "눈"])
+    ]
+    cloudy_count = sum(
+        1
+        for value in main_values + description_values
+        if any(token in value for token in ["cloud", "overcast", "흐림", "구름"])
+    )
+    clear_count = sum(
+        1
+        for value in main_values + description_values
+        if any(token in value for token in ["clear", "맑음"])
+    )
+
+    if rain_indexes:
+        condition = "비 가능성"
+        display_text = _rain_display_text(forecasts)
+    elif snow_indexes:
+        condition = "눈 가능성"
+        display_text = "오늘 눈 가능성"
+    elif cloudy_count > clear_count:
+        condition = "흐림"
+        display_text = "대체로 흐림"
+    elif clear_count >= cloudy_count and clear_count > 0:
+        condition = "맑음"
+        display_text = "대체로 맑음"
+    elif "mist" in joined or "fog" in joined or "안개" in joined:
+        condition = "흐림"
+        display_text = "안개 또는 흐림"
+    else:
+        fallback = description_values[0] if description_values else "확인 불가"
+        condition = fallback
+        display_text = fallback
+
+    pm10_status = air_quality.get("pm10Status")
+    pm25_status = air_quality.get("pm25Status")
+    if _is_bad_air(pm10_status) or _is_bad_air(pm25_status):
+        if condition == "맑음":
+            display_text = "맑지만 미세먼지 나쁨"
+        else:
+            display_text = f"{display_text} · 미세먼지 나쁨"
+
+    return naturalize_weather_text(condition), naturalize_weather_text(display_text)
+
+
+def _rain_display_text(forecasts):
+    rain_times = []
+    for item in forecasts:
+        weather = item.get("weather", [{}])[0]
+        text = f"{weather.get('main', '')} {weather.get('description', '')}".lower()
+        if any(token in text for token in ["rain", "drizzle", "thunderstorm", "비", "소나기", "실비"]):
+            rain_times.append(item)
+
+    if not rain_times:
+        return "비 가능성"
+
+    first = rain_times[0]
+    hour_text = ""
+    if first.get("dt"):
+        try:
+            kst = timezone(timedelta(hours=9))
+            hour = datetime.fromtimestamp(
+                first["dt"],
+                tz=timezone.utc,
+            ).astimezone(kst).hour
+            if 5 <= hour < 12:
+                hour_text = "오전 "
+            elif 12 <= hour < 18:
+                hour_text = "오후 "
+            elif 18 <= hour < 24:
+                hour_text = "저녁 "
+        except Exception:
+            hour_text = ""
+
+    rain_amounts = [
+        item.get("rain", {}).get("3h", 0) or 0
+        for item in rain_times
+    ]
+    max_rain = max(rain_amounts) if rain_amounts else 0
+    strength = "약한 " if max_rain and max_rain < 3 else ""
+    return f"{hour_text}{strength}비 가능성".strip()
+
+
+def _is_bad_air(status):
+    return status in ["나쁨", "매우나쁨"]
+
+
+def naturalize_weather_text(text):
+    if not text:
+        return "확인 불가"
+    return (
+        str(text)
+        .replace("튼구름", "구름 조금")
+        .replace("실 비", "약한 비 가능성")
+        .replace("실비", "약한 비 가능성")
+        .replace("온흐림", "대체로 흐림")
+        .strip()
+    )
+
+
+def weather_icon_key(condition):
+    key = str(condition or "").lower().replace(" ", "")
+    if any(token in key for token in ["snow", "눈"]):
+        return "snow"
+    if any(token in key for token in ["rain", "drizzle", "thunderstorm", "비", "소나기"]):
+        return "rain"
+    if any(token in key for token in ["mist", "fog", "안개"]):
+        return "mist"
+    if any(token in key for token in ["cloud", "overcast", "흐림", "구름"]):
+        return "clouds"
+    if any(token in key for token in ["clear", "맑"]):
+        return "clear"
+    return "clear"
+
+
+def build_hourly_forecast(forecasts):
+    hourly = []
+    kst = timezone(timedelta(hours=9))
+    for item in forecasts:
+        dt = item.get("dt")
+        if dt is None:
+            continue
+        forecast_time = datetime.fromtimestamp(
+            dt,
+            tz=timezone.utc,
+        ).astimezone(kst)
+        if forecast_time.hour < 6:
+            continue
+
+        weather = item.get("weather", [{}])[0]
+        raw_condition = (
+            weather.get("description")
+            or weather.get("main")
+            or "확인 불가"
+        )
+        condition = naturalize_weather_text(raw_condition)
+        temperature = item.get("main", {}).get("temp")
+        hourly.append(
+            {
+                "time": f"{forecast_time.hour:02d}시",
+                "temperature": round(temperature) if temperature is not None else None,
+                "condition": condition,
+                "icon": weather_icon_key(condition),
+            }
+        )
+    return hourly
+
+
 def get_weather_data(weather_locations=None):
     locations = normalize_weather_locations(
         weather_locations or DEFAULT_WEATHER_LOCATIONS
@@ -511,17 +710,15 @@ def get_weather_data(weather_locations=None):
             if response.status_code != 200:
                 raise Exception(data)
 
-            city_timezone_seconds = data["city"]["timezone"]
-            city_timezone = timezone(timedelta(seconds=city_timezone_seconds))
-
-            today = datetime.now(city_timezone).date()
+            kst = timezone(timedelta(hours=9))
+            today = datetime.now(kst).date()
             forecasts_by_date = {}
 
             for item in data["list"]:
                 forecast_time = datetime.fromtimestamp(
                     item["dt"],
-                    tz=city_timezone,
-                )
+                    tz=timezone.utc,
+                ).astimezone(kst)
                 forecast_date = forecast_time.date()
 
                 if forecast_date not in forecasts_by_date:
@@ -536,29 +733,40 @@ def get_weather_data(weather_locations=None):
 
             selected_forecasts = forecasts_by_date[selected_date]
 
-            temps = [
-                item["main"]["temp"]
+            lows = [
+                item.get("main", {}).get("temp_min", item.get("main", {}).get("temp"))
                 for item in selected_forecasts
+                if item.get("main", {}).get("temp_min", item.get("main", {}).get("temp")) is not None
+            ]
+            highs = [
+                item.get("main", {}).get("temp_max", item.get("main", {}).get("temp"))
+                for item in selected_forecasts
+                if item.get("main", {}).get("temp_max", item.get("main", {}).get("temp")) is not None
             ]
 
-            conditions = [
-                item["weather"][0]["description"]
-                for item in selected_forecasts
-            ]
+            if not lows or not highs:
+                raise Exception("오늘 예보 기온 데이터가 없습니다.")
 
-            most_common_condition = Counter(conditions).most_common(1)[0][0]
+            air_quality = get_air_quality(
+                city["lat"],
+                city["lon"],
+            )
+            condition, display_text = summarize_daily_weather(
+                selected_forecasts,
+                air_quality,
+            )
+            hourly_forecast = build_hourly_forecast(selected_forecasts)
 
             weather_items.append(
                 {
                     "name": city["name"],
-                    "low": round(min(temps)),
-                    "high": round(max(temps)),
-                    "condition": most_common_condition,
+                    "low": round(min(lows)),
+                    "high": round(max(highs)),
+                    "condition": condition,
+                    "displayText": display_text,
                     "isMain": city.get("isMain", False),
-                    "airQuality": get_air_quality(
-                        city["lat"],
-                        city["lon"],
-                    ),
+                    "hourlyForecast": hourly_forecast,
+                    "airQuality": air_quality,
                 }
             )
 
@@ -571,7 +779,9 @@ def get_weather_data(weather_locations=None):
                     "low": None,
                     "high": None,
                     "condition": "예보 조회 실패",
+                    "displayText": "예보 조회 실패",
                     "isMain": city.get("isMain", False),
+                    "hourlyForecast": [],
                     "airQuality": get_air_quality(
                         city["lat"],
                         city["lon"],
@@ -598,10 +808,12 @@ def get_market_data(selected_assets=None):
 
         try:
             ticker = yf.Ticker(ticker_value)
-            history = ticker.history(period="2d")
+            history = ticker.history(period="5d")
+            history = history.dropna(subset=["Close"])
 
             if len(history) < 2:
                 print(f"Not enough market data: {ticker_value}")
+                items.append(fallback_market_item(asset))
                 continue
 
             prev_close = history["Close"].iloc[-2]
@@ -617,14 +829,33 @@ def get_market_data(selected_assets=None):
                     "symbol": asset["symbol"],
                     "name": asset["name"],
                     "ticker": ticker_value,
+                    "price": round(float(current), 2),
                     "changePercent": change_percent,
+                    "yahooUrl": yahoo_finance_url(ticker_value),
                 }
             )
 
         except Exception as e:
             print(f"Market error - {ticker_value}:", e)
+            items.append(fallback_market_item(asset))
 
     return items
+
+
+def fallback_market_item(asset):
+    ticker_value = asset["ticker"]
+    return {
+        "symbol": asset["symbol"],
+        "name": asset["name"],
+        "ticker": ticker_value,
+        "price": None,
+        "changePercent": MARKET_FALLBACK_CHANGES.get(ticker_value, 0.0),
+        "yahooUrl": yahoo_finance_url(ticker_value),
+    }
+
+
+def yahoo_finance_url(ticker):
+    return f"https://finance.yahoo.com/quote/{quote(str(ticker), safe='')}"
 
 
 # =========================
@@ -677,6 +908,246 @@ def fetch_news_by_keyword(keyword, display=2):
         return []
 
 
+CORE_MARKET_TERMS = [
+    "ai",
+    "반도체",
+    "엔비디아",
+    "nvidia",
+    "금리",
+    "연준",
+    "fomc",
+    "환율",
+    "달러",
+    "원화",
+    "나스닥",
+    "s&p",
+    "비트코인",
+    "bitcoin",
+    "물가",
+    "cpi",
+    "채권",
+    "유가",
+    "실적",
+]
+
+LIFE_IMPACT_TERMS = [
+    "날씨",
+    "미세먼지",
+    "교통",
+    "파업",
+    "요금",
+    "물가",
+    "유가",
+    "전기",
+    "가스",
+]
+
+CLICKBAIT_TERMS = [
+    "충격",
+    "경악",
+    "대박",
+    "난리",
+    "헉",
+    "무슨 일",
+    "알고보니",
+    "초비상",
+    "단독?",
+]
+
+LOW_VALUE_TERMS = [
+    "포토",
+    "영상",
+    "화보",
+    "오늘의 운세",
+    "로또",
+    "행사",
+    "이벤트",
+    "쿠폰",
+]
+
+
+def _normalize_news_text(value):
+    return re.sub(r"\s+", " ", clean_html_text(value)).strip()
+
+
+def _normalize_for_dedupe(value):
+    text = clean_html_text(value).lower()
+    text = re.sub(r"\[[^\]]+\]|【[^】]+】|\([^)]*\)", " ", text)
+    text = re.sub(r"[^0-9a-z가-힣]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _news_tokens(value):
+    normalized = _normalize_for_dedupe(value)
+    return {
+        token
+        for token in normalized.split()
+        if len(token) >= 2 and token not in {"뉴스", "기자", "속보", "종합"}
+    }
+
+
+def _published_datetime(value):
+    try:
+        return parsedate_to_datetime(value or "").astimezone(timezone.utc)
+    except Exception:
+        return datetime.now(timezone.utc) - timedelta(days=365)
+
+
+def _contains_any(text, terms):
+    lowered = text.lower()
+    return any(term.lower() in lowered for term in terms)
+
+
+def _keyword_terms(keyword):
+    terms = [keyword.strip().lower()]
+    terms.extend(
+        term
+        for term in re.split(r"\s+|/|,", keyword.lower())
+        if len(term.strip()) >= 2
+    )
+    return list(dict.fromkeys(term for term in terms if term))
+
+
+def _news_relevance_score(item, keywords):
+    title = item["title"].lower()
+    summary = item["summary"].lower()
+    content = f"{title} {summary} {item['keyword'].lower()}"
+    score = 0
+
+    for keyword in keywords:
+        for term in _keyword_terms(keyword):
+            if term in title:
+                score += 12
+            if term in summary:
+                score += 5
+            if term == item["keyword"].lower():
+                score += 4
+
+    for term in CORE_MARKET_TERMS:
+        if term in title:
+            score += 7
+        elif term in content:
+            score += 3
+
+    for term in LIFE_IMPACT_TERMS:
+        if term in title:
+            score += 3
+        elif term in content:
+            score += 1
+
+    age_hours = max(
+        0,
+        (
+            datetime.now(timezone.utc)
+            - _published_datetime(item.get("publishedAt"))
+        ).total_seconds()
+        / 3600,
+    )
+    if age_hours <= 12:
+        score += 4
+    elif age_hours <= 24:
+        score += 2
+    elif age_hours > 72:
+        score -= 8
+
+    if _contains_any(title, CLICKBAIT_TERMS):
+        score -= 8
+    if _contains_any(content, LOW_VALUE_TERMS):
+        score -= 10
+    if len(title) < 12:
+        score -= 4
+    if not item.get("summary"):
+        score -= 3
+
+    return score
+
+
+def _is_low_value_news(item, keywords):
+    title = item["title"]
+    summary = item["summary"]
+    content = f"{title} {summary}"
+    has_keyword_signal = any(
+        term in content.lower()
+        for keyword in keywords
+        for term in _keyword_terms(keyword)
+    )
+    if not has_keyword_signal and not _contains_any(content, CORE_MARKET_TERMS):
+        return True
+    if _contains_any(title, LOW_VALUE_TERMS):
+        return True
+    if _contains_any(title, CLICKBAIT_TERMS) and not _contains_any(
+        content,
+        CORE_MARKET_TERMS,
+    ):
+        return True
+    return False
+
+
+def _is_duplicate_news(item, selected):
+    title_key = _normalize_for_dedupe(item["title"])
+    item_tokens = _news_tokens(item["title"])
+    for existing in selected:
+        if item.get("link") and item.get("link") == existing.get("link"):
+            return True
+        existing_key = _normalize_for_dedupe(existing["title"])
+        if title_key == existing_key:
+            return True
+        existing_tokens = _news_tokens(existing["title"])
+        if not item_tokens or not existing_tokens:
+            continue
+        similarity = len(item_tokens & existing_tokens) / len(
+            item_tokens | existing_tokens
+        )
+        if similarity >= 0.62:
+            return True
+    return False
+
+
+def _select_briefing_news(candidates, keywords, limit=6, per_keyword_limit=2):
+    scored = []
+    for item in candidates:
+        if _is_low_value_news(item, keywords):
+            continue
+        score = _news_relevance_score(item, keywords)
+        if score <= 0:
+            continue
+        item["relevanceScore"] = score
+        scored.append(item)
+
+    scored.sort(
+        key=lambda item: (
+            item.get("relevanceScore", 0),
+            _published_datetime(item.get("publishedAt")),
+        ),
+        reverse=True,
+    )
+
+    selected = []
+    keyword_counts = {}
+
+    for item in scored:
+        keyword = item.get("keyword") or ""
+        if keyword_counts.get(keyword, 0) >= per_keyword_limit:
+            continue
+        if _is_duplicate_news(item, selected):
+            continue
+        selected.append(item)
+        keyword_counts[keyword] = keyword_counts.get(keyword, 0) + 1
+        if len(selected) >= limit:
+            break
+
+    if len(selected) < min(3, limit):
+        for item in scored:
+            if _is_duplicate_news(item, selected):
+                continue
+            selected.append(item)
+            if len(selected) >= min(3, limit):
+                break
+
+    return selected[:limit]
+
+
 def get_news_data(keywords=None):
     normalized_keywords = normalize_news_keywords(
         keywords or DEFAULT_NEWS_KEYWORDS
@@ -684,27 +1155,24 @@ def get_news_data(keywords=None):
 
     print("NEWS KEYWORDS USED:", normalized_keywords)
 
-    news_items = []
+    candidates = []
     used_links = set()
 
     for keyword in normalized_keywords:
-        items = fetch_news_by_keyword(keyword, display=2)
+        items = fetch_news_by_keyword(keyword, display=8)
 
         for item in items:
             link = item.get("originallink") or item.get("link")
 
-            if not link:
-                continue
-
-            if link in used_links:
+            if not link or link in used_links:
                 continue
 
             used_links.add(link)
 
-            news_items.append(
+            candidates.append(
                 {
-                    "title": clean_html_text(item.get("title", "")),
-                    "summary": clean_html_text(item.get("description", "")),
+                    "title": _normalize_news_text(item.get("title", "")),
+                    "summary": _normalize_news_text(item.get("description", "")),
                     "source": "네이버뉴스",
                     "keyword": keyword,
                     "link": link,
@@ -712,7 +1180,12 @@ def get_news_data(keywords=None):
                 }
             )
 
-    return news_items[:6]
+    return _select_briefing_news(
+        candidates,
+        normalized_keywords,
+        limit=6,
+        per_keyword_limit=2,
+    )
 
 
 # =========================
